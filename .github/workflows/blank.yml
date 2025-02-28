@@ -1,0 +1,333 @@
+import os
+import requests
+import telebot
+from telebot import types
+from deep_translator import GoogleTranslator
+import random
+import string
+import google.generativeai as genai  
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from datetime import datetime
+import logging
+from langdetect import detect
+
+# إعداد تسجيل الأخطاء
+logging.basicConfig(filename='bot_errors.log', level=logging.ERROR, format='%(asctime)s - %(message)s')
+
+# ضع هنا القيم الخاصة بك (استبدلها بالقيم الحقيقية)
+API_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'         # توكن بوت تيليجرام
+API_GEMINI = 'YOUR_GEMINI_API_KEY'              # مفتاح API الخاص بـ Gemini (إن كنت تستخدمه)
+ADMIN_ID = 123456789                           # رقم معرف الأدمن
+
+bot = telebot.TeleBot(API_TOKEN)
+
+# إعداد ملف المستخدمين
+USERS_FILE = 'users.txt'
+if not os.path.exists(USERS_FILE):
+    open(USERS_FILE, 'w').close()
+
+# المتغيرات العامة
+banned_users = set()
+admins = {ADMIN_ID}     # الأدمن الافتراضي هو الأدمن الرئيسي
+users = {}
+broadcast_list = []
+user_sessions = {}
+
+# إعداد مجلد الصور
+IMAGE_FOLDER = "images"
+os.makedirs(IMAGE_FOLDER, exist_ok=True)
+
+# دالة لحفظ بيانات المستخدم الجديد وإعلام الأدمن
+def save_user(user_id, username, full_name):
+    user_id_str = str(user_id)
+    new_user = False
+    with open(USERS_FILE, 'r') as f:
+        users_list = f.read().splitlines()
+    if user_id_str not in users_list:
+        new_user = True
+        with open(USERS_FILE, 'a') as f:
+            f.write(user_id_str + '\n')
+    if new_user:
+        with open(USERS_FILE, 'r') as f:
+            total_users = len(f.read().splitlines())
+        try:
+            bot.send_message(
+                ADMIN_ID,
+                f"""👾 دخل شخص جديد:
+- الاسم: {full_name or 'غير متوفر'}
+- المعرف: @{username if username else 'غير متوفر'}
+- ID: {user_id}
+• إجمالي الأعضاء: {total_users}"""
+            )
+        except Exception as e:
+            logging.error(f"Error sending new user info: {e}")
+
+# دالة الحصول على إحصائيات المستخدمين
+def get_statistics():
+    if not os.path.exists(USERS_FILE) or os.stat(USERS_FILE).st_size == 0:
+        return "🚫 لا يوجد مستخدمون حتى الآن."
+    with open(USERS_FILE, 'r') as f:
+        users_list = f.read().splitlines()
+    total_users = len(users_list)
+    last_users = users_list[-10:]
+    last_users_str = "\n".join([f"ID: {uid}" for uid in last_users])
+    return f"👥 إجمالي المستخدمين: {total_users}\n\n📌 آخر 10 مستخدمين:\n{last_users_str}"
+
+# قائمة الأدمن (لوحة التحكم)
+def get_admin_menu():
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("👥 إدارة المستخدمين", callback_data="manage_users"))
+    markup.add(InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"))
+    markup.add(InlineKeyboardButton("📢 الإذاعة", callback_data="broadcast"))
+    markup.add(InlineKeyboardButton("📢 إذاعة بالتثبيت", callback_data="broadcast_pin"))
+    return markup
+
+def get_manage_users_menu():
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🚫 حضر مستخدم", callback_data="ban_user"))
+    markup.add(InlineKeyboardButton("🔓 فك الحظر", callback_data="unban_user"))
+    markup.add(InlineKeyboardButton("➕ إضافة أدمن", callback_data="add_admin"))
+    markup.add(InlineKeyboardButton("➖ حذف أدمن", callback_data="remove_admin"))
+    return markup
+
+# أمر /start
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+    save_user(user_id, username, message.from_user.first_name)
+
+    if user_id in banned_users:
+        bot.send_message(user_id, "❌ أنت محظور من استخدام هذا البوت.")
+        return
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("المطور", url="https://www.facebook.com/time.bird.boykta))
+    markup.add(InlineKeyboardButton("بوت ديني", url="https://t.me/boytaabot))
+
+    bot.send_message(
+        message.chat.id,
+        """```✎مايكي```
+
+*• أهلا بك عزيزي*  
+• في بوت الذكاء الاصطناعي 🤖  
+
+• أوامر البوت:
+- `بوتي + سؤالك` → للتحدث مع الذكاء الاصطناعي  
+- `/image + وصف` → لإنشاء صورة  
+- `/Write + نص` → لإنشاء صورة تحتوي على النص  
+- `/clear` → لإنهاء المحادثة""",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+# أمر /clear لإنهاء محادثة الذكاء الاصطناعي
+@bot.message_handler(commands=['clear'])
+def close_ai_chat_command(message):
+    user_id = message.chat.id
+    if user_id in user_sessions:
+        del user_sessions[user_id]
+        bot.send_message(user_id, "❌ تم إغلاق المحادثة مع الذكاء الاصطناعي.")
+
+# أمر التحدث مع الذكاء الاصطناعي (يبدأ بـ "بوتي")
+@bot.message_handler(func=lambda message: message.text and message.text.lower().startswith("بوتي"))
+def ai_chat_command(message):
+    user_id = message.chat.id
+    user_content = message.text.replace('بوتي', '').strip()
+
+    if not user_content:
+        bot.send_message(user_id, "❌ يرجى إدخال نص بعد الأمر `بوتي`")
+        return
+
+    try:
+        language = detect(user_content)
+        # ترجمة النص إلى الإنجليزية إذا كان بالعربية
+        translated_user_content_en = GoogleTranslator(source=language, target='en').translate(user_content) if language == 'ar' else user_content
+    except Exception as e:
+        logging.error(f"Error detecting language: {e}")
+        translated_user_content_en = user_content
+
+    genai.configure(api_key=API_GEMINI)
+    if user_id not in user_sessions:
+        try:
+            user_sessions[user_id] = genai.GenerativeModel(model_name="gemini-1.5-flash").start_chat(history=[])
+        except Exception as e:
+            logging.error(f"Error starting chat session: {e}")
+            bot.send_message(user_id, "❌ خطأ في بدء جلسة الذكاء الاصطناعي.")
+            return
+
+    chat_session = user_sessions[user_id]
+
+    try:
+        bot.send_chat_action(user_id, 'typing')
+        response = chat_session.send_message(translated_user_content_en)
+        translated_response_ar = GoogleTranslator(source='en', target='ar').translate(response.text)
+        bot.send_message(user_id, f"*🤖 الذكاء الاصطناعي:*\n{translated_response_ar}", parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Error in AI chat: {e}")
+        bot.send_message(user_id, "❌ حدث خطأ أثناء معالجة طلبك.")
+
+# أمر /image لإنشاء صورة بناءً على الوصف باستخدام API خارجي (مثلاً DeepAI)
+@bot.message_handler(commands=['image'])
+def create_image_with_description(message):
+    description = message.text.replace('/image', '').strip()
+    if not description:
+        bot.send_message(message.chat.id, "❌ يرجى إدخال وصف للصورة بعد `/image`")
+        return
+
+    bot.send_message(message.chat.id, f"🎨 جاري إنشاء الصورة بوصف: {description}")
+    try:
+        translated_description = GoogleTranslator(source='auto', target='en').translate(description)
+        # مثال لاستخدام DeepAI Text2Img API (استبدل YOUR_DEEPAI_API_KEY بالمفتاح الصحيح)
+        response = requests.post(
+            "https://api.deepai.org/api/text2img",
+            data={'text': translated_description},
+            headers={'api-key': 'YOUR_DEEPAI_API_KEY'}
+        )
+        image_url = response.json().get("output_url")
+        if image_url:
+            bot.send_photo(message.chat.id, image_url, caption="✅ تم إنشاء الصورة بنجاح.")
+        else:
+            bot.send_message(message.chat.id, "❌ فشل في إنشاء الصورة.")
+    except Exception as e:
+        logging.error(f"Error creating image: {e}")
+        bot.send_message(message.chat.id, "❌ حدث خطأ أثناء معالجة الصورة.")
+
+# أمر /Write لإنشاء صورة تحتوي على نص
+@bot.message_handler(commands=['Write'])
+def create_text_image(message):
+    text = message.text.replace('/Write', '').strip()
+    if not text:
+        bot.send_message(message.chat.id, "❌ يرجى إدخال النص بعد `/Write`")
+        return
+
+    bot.send_message(message.chat.id, f"📝 جاري إنشاء صورة للنص: {text}")
+    try:
+        # ترجمة النص إلى الإنجليزية إذا كان بالعربية
+        if any('\u0600' <= c <= '\u06FF' for c in text):
+            text = GoogleTranslator(source='ar', target='en').translate(text)
+        img_url = f"https://apis.xditya.me/write?text={text}"
+        response = requests.get(img_url)
+        if response.status_code == 200:
+            image_path = os.path.join(IMAGE_FOLDER, "text_image.jpg")
+            with open(image_path, "wb") as f:
+                f.write(response.content)
+            with open(image_path, "rb") as photo:
+                bot.send_photo(message.chat.id, photo, caption="✅ تم إنشاء صورة النص بنجاح.", parse_mode="Markdown")
+            os.remove(image_path)
+        else:
+            bot.send_message(message.chat.id, "❌ فشل في إنشاء صورة النص.")
+    except Exception as e:
+        logging.error(f"Error creating text image: {e}")
+        bot.send_message(message.chat.id, "❌ حدث خطأ أثناء إنشاء صورة النص.")
+
+# أوامر الأدمن
+@bot.message_handler(commands=['admin'])
+def admin_start(message):
+    user_id = message.from_user.id
+    if user_id in banned_users:
+        bot.send_message(user_id, "❌ أنت محظور من استخدام هذا البوت.")
+        return
+
+    if user_id not in users:
+        users[user_id] = {"username": message.from_user.username, "joined": datetime.now()}
+
+    if user_id in admins:
+        bot.send_message(user_id, "مرحبًا بك في لوحة التحكم", reply_markup=get_admin_menu())
+    else:
+        bot.send_message(user_id, "❌ ليس لديك صلاحيات الأدمن.")
+
+# معالج الاستجابة للأزرار في لوحة الأدمن
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query(call):
+    user_id = call.from_user.id
+    if user_id in banned_users:
+        bot.send_message(user_id, "❌ أنت محظور من استخدام هذا البوت.")
+        return
+
+    if call.data == "manage_users":
+        if user_id in admins:
+            bot.send_message(user_id, "إدارة المستخدمين", reply_markup=get_manage_users_menu())
+    elif call.data == "ban_user":
+        if user_id in admins:
+            msg = bot.send_message(user_id, "أرسل ID المستخدم الذي تريد حظره:")
+            bot.register_next_step_handler(msg, ban_user)
+    elif call.data == "unban_user":
+        if user_id in admins:
+            msg = bot.send_message(user_id, "أرسل ID المستخدم الذي تريد فك حظره:")
+            bot.register_next_step_handler(msg, unban_user)
+    elif call.data == "add_admin":
+        if user_id in admins:
+            msg = bot.send_message(user_id, "أرسل ID المستخدم الذي تريد إضافته كأدمن:")
+            bot.register_next_step_handler(msg, add_admin)
+    elif call.data == "remove_admin":
+        if user_id in admins:
+            msg = bot.send_message(user_id, "أرسل ID المستخدم الذي تريد حذفه من الأدمن:")
+            bot.register_next_step_handler(msg, remove_admin)
+    elif call.data == "statistics":
+        if user_id in admins:
+            stats = get_statistics()
+            bot.send_message(user_id, stats)
+    elif call.data == "broadcast":
+        if user_id in admins:
+            msg = bot.send_message(user_id, "✉️ أرسل الرسالة التي تريد إرسالها لجميع المستخدمين:")
+            bot.register_next_step_handler(msg, send_broadcast)
+    elif call.data == "broadcast_pin":
+        if user_id in admins:
+            msg = bot.send_message(user_id, "📌 أرسل الرسالة التي تريد إرسالها لجميع المستخدمين مع التثبيت:")
+            bot.register_next_step_handler(msg, send_broadcast, pin=True)
+
+def ban_user(message):
+    try:
+        user_id_to_ban = int(message.text)
+        banned_users.add(user_id_to_ban)
+        bot.send_message(message.chat.id, f"✅ تم حظر المستخدم: {user_id_to_ban}")
+    except Exception as e:
+        logging.error(f"Error banning user: {e}")
+        bot.send_message(message.chat.id, "❌ حدث خطأ أثناء حظر المستخدم.")
+
+def unban_user(message):
+    try:
+        user_id_to_unban = int(message.text)
+        banned_users.discard(user_id_to_unban)
+        bot.send_message(message.chat.id, f"✅ تم فك الحظر عن المستخدم: {user_id_to_unban}")
+    except Exception as e:
+        logging.error(f"Error unbanning user: {e}")
+        bot.send_message(message.chat.id, "❌ حدث خطأ أثناء فك حظر المستخدم.")
+
+def add_admin(message):
+    try:
+        new_admin_id = int(message.text)
+        admins.add(new_admin_id)
+        bot.send_message(message.chat.id, f"✅ تمت إضافة الأدمن: {new_admin_id}")
+    except Exception as e:
+        logging.error(f"Error adding admin: {e}")
+        bot.send_message(message.chat.id, "❌ حدث خطأ أثناء إضافة الأدمن.")
+
+def remove_admin(message):
+    try:
+        admin_id_to_remove = int(message.text)
+        admins.discard(admin_id_to_remove)
+        bot.send_message(message.chat.id, f"✅ تم حذف الأدمن: {admin_id_to_remove}")
+    except Exception as e:
+        logging.error(f"Error removing admin: {e}")
+        bot.send_message(message.chat.id, "❌ حدث خطأ أثناء حذف الأدمن.")
+
+def send_broadcast(message, pin=False):
+    try:
+        with open(USERS_FILE, 'r') as f:
+            all_users = f.read().splitlines()
+        for uid in all_users:
+            try:
+                sent_message = bot.send_message(uid, message.text)
+                if pin:
+                    bot.pin_chat_message(uid, sent_message.message_id)
+            except Exception as ex:
+                logging.error(f"Error broadcasting to {uid}: {ex}")
+        bot.send_message(message.chat.id, "✅ تم إرسال الرسالة بنجاح!")
+    except Exception as e:
+        logging.error(f"Error in broadcast: {e}")
+        bot.send_message(message.chat.id, "❌ حدث خطأ أثناء الإذاعة.")
+
+# بدء عمل البوت
+bot.polling()
